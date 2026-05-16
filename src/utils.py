@@ -11,7 +11,13 @@ from torchvision import transforms
 
 
 CLASS_NAMES = ["mano_abierta", "puno", "paz", "pulgar_arriba"]
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+DISPLAY_CLASS_NAMES = {
+    "mano_abierta": "palma",
+    "puno": "puno",
+    "paz": "paz",
+    "pulgar_arriba": "pulgar_arriba",
+}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".avif"}
 DATASET_LIMITS = {"small": 25, "medium": 50}
 
 
@@ -60,7 +66,7 @@ def find_images(class_dir):
     )
 
 
-def load_dataset_samples(dataset_dir, dataset_size, seed=42):
+def load_dataset_samples(dataset_dir, dataset_size, seed=42, min_images_per_class=None):
     """
     Carga rutas de imagen usando maximo 25 o 50 imagenes por clase.
 
@@ -73,6 +79,8 @@ def load_dataset_samples(dataset_dir, dataset_size, seed=42):
 
     dataset_path = verify_dataset_structure(dataset_dir)
     max_per_class = DATASET_LIMITS[dataset_size]
+    if min_images_per_class is not None:
+        max_per_class = max(max_per_class, min_images_per_class)
     rng = random.Random(seed)
     samples_by_class = {}
 
@@ -86,7 +94,7 @@ def load_dataset_samples(dataset_dir, dataset_size, seed=42):
         rng.shuffle(images)
         selected_images = images[:max_per_class]
 
-        if len(images) < max_per_class:
+        if min_images_per_class is None and len(images) < max_per_class:
             print(
                 f"Aviso: clase '{class_name}' tiene {len(images)} imagenes; "
                 f"se usaran todas para '{dataset_size}'."
@@ -97,7 +105,13 @@ def load_dataset_samples(dataset_dir, dataset_size, seed=42):
     return samples_by_class
 
 
-def split_samples(samples_by_class, train_ratio=0.70, val_ratio=0.15, seed=42):
+def split_samples(
+    samples_by_class,
+    train_ratio=0.70,
+    val_ratio=0.15,
+    seed=42,
+    train_images_per_class=None,
+):
     """Divide cada clase en entrenamiento, validacion y prueba."""
     rng = random.Random(seed)
     train_samples = []
@@ -115,8 +129,23 @@ def split_samples(samples_by_class, train_ratio=0.70, val_ratio=0.15, seed=42):
                 "en train/val/test."
             )
 
-        train_count = max(1, int(total * train_ratio))
-        val_count = max(1, int(total * val_ratio))
+        if train_images_per_class is not None:
+            if train_images_per_class < 1:
+                raise ValueError("train_images_per_class debe ser mayor que 0.")
+            if total < train_images_per_class + 2:
+                raise ValueError(
+                    f"La clase '{class_name}' necesita al menos "
+                    f"{train_images_per_class + 2} imagenes: "
+                    f"{train_images_per_class} para entrenamiento, 1 para validacion "
+                    "y 1 para prueba."
+                )
+
+            train_count = train_images_per_class
+            remaining = total - train_count
+            val_count = max(1, int(remaining / 2))
+        else:
+            train_count = max(1, int(total * train_ratio))
+            val_count = max(1, int(total * val_ratio))
 
         if train_count + val_count >= total:
             val_count = 1
@@ -158,10 +187,30 @@ def get_eval_transforms():
     )
 
 
-def create_dataloaders(dataset_dir, dataset_size, batch_size, seed=42, num_workers=0):
+def create_dataloaders(
+    dataset_dir,
+    dataset_size,
+    batch_size,
+    seed=42,
+    num_workers=0,
+    train_images_per_class=None,
+):
     """Crea DataLoaders de PyTorch para train, val y test."""
-    samples_by_class = load_dataset_samples(dataset_dir, dataset_size, seed=seed)
-    train_samples, val_samples, test_samples = split_samples(samples_by_class, seed=seed)
+    min_images_per_class = None
+    if train_images_per_class is not None:
+        min_images_per_class = train_images_per_class + 2
+
+    samples_by_class = load_dataset_samples(
+        dataset_dir,
+        dataset_size,
+        seed=seed,
+        min_images_per_class=min_images_per_class,
+    )
+    train_samples, val_samples, test_samples = split_samples(
+        samples_by_class,
+        seed=seed,
+        train_images_per_class=train_images_per_class,
+    )
 
     train_dataset = HandPoseDataset(train_samples, transform=get_train_transforms())
     val_dataset = HandPoseDataset(val_samples, transform=get_eval_transforms())
@@ -193,12 +242,29 @@ def create_dataloaders(dataset_dir, dataset_size, batch_size, seed=42, num_worke
 
 def print_dataset_summary(samples_by_class, train_samples, val_samples, test_samples):
     """Muestra un resumen para confirmar que se usa el dataset propio."""
+    train_counts = count_samples_by_class(train_samples)
+    val_counts = count_samples_by_class(val_samples)
+    test_counts = count_samples_by_class(test_samples)
+
     print("\nResumen del dataset:")
     for class_name, samples in samples_by_class.items():
-        print(f"  {class_name}: {len(samples)} imagenes seleccionadas")
+        print(
+            f"  {class_name}: {len(samples)} imagenes seleccionadas | "
+            f"train: {train_counts[class_name]} | "
+            f"val: {val_counts[class_name]} | "
+            f"test: {test_counts[class_name]}"
+        )
     print(f"  Entrenamiento: {len(train_samples)} imagenes")
     print(f"  Validacion: {len(val_samples)} imagenes")
     print(f"  Prueba: {len(test_samples)} imagenes\n")
+
+
+def count_samples_by_class(samples):
+    """Cuenta cuantas muestras hay de cada clase en una lista."""
+    counts = {class_name: 0 for class_name in CLASS_NAMES}
+    for _, label in samples:
+        counts[CLASS_NAMES[label]] += 1
+    return counts
 
 
 def get_device():

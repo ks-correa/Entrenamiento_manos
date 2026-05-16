@@ -76,6 +76,12 @@ def main():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=0.001)
+    parser.add_argument(
+        "--train_images_per_class",
+        type=int,
+        default=None,
+        help="Numero exacto de imagenes por clase que se usaran para entrenamiento.",
+    )
     args = parser.parse_args()
 
     Path("models").mkdir(exist_ok=True)
@@ -88,6 +94,7 @@ def main():
         args.dataset,
         args.dataset_size,
         args.batch_size,
+        train_images_per_class=args.train_images_per_class,
     )
 
     model = build_resnet18(num_classes=len(class_names)).to(device)
