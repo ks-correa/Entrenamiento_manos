@@ -8,19 +8,21 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 
 from train_cnn import CustomCNN
 from train_resnet import build_resnet18
-from utils import CLASS_NAMES, append_metrics_csv, create_dataloaders, get_device
+from utils import CLASS_NAMES, DATASET_LIMITS, append_metrics_csv, create_dataloaders, get_device
 
 
 def load_model(model_path, architecture, num_classes, device):
     """Carga un modelo guardado segun la arquitectura indicada."""
+    checkpoint = torch.load(model_path, map_location=device)
+    classifier_dropout = checkpoint.get("classifier_dropout", 0.0)
+
     if architecture == "cnn":
         model = CustomCNN(num_classes=num_classes)
     elif architecture == "resnet":
-        model = build_resnet18(num_classes=num_classes)
+        model = build_resnet18(num_classes=num_classes, classifier_dropout=classifier_dropout)
     else:
         raise ValueError("architecture debe ser 'cnn' o 'resnet'.")
 
-    checkpoint = torch.load(model_path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict)
     model.to(device)
@@ -77,17 +79,17 @@ def main():
     parser.add_argument("--model", required=True, help="Ruta al archivo .pth del modelo.")
     parser.add_argument("--architecture", choices=["cnn", "resnet"], required=True)
     parser.add_argument("--dataset", default="dataset", help="Ruta al dataset propio.")
-    parser.add_argument("--dataset_size", choices=["small", "medium"], required=True)
+    parser.add_argument("--dataset_size", choices=list(DATASET_LIMITS), required=True)
     parser.add_argument("--batch_size", type=int, default=8)
     args = parser.parse_args()
 
     device = get_device()
-    print(f"Dispositivo usado: {device}")
 
     _, _, test_loader, class_names = create_dataloaders(
         args.dataset,
         args.dataset_size,
         args.batch_size,
+        balanced_sampling=False,
     )
 
     model = load_model(args.model, args.architecture, len(class_names), device)

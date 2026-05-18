@@ -6,7 +6,14 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-from utils import calculate_accuracy, create_dataloaders, get_device, save_metrics_csv, save_training_plot
+from utils import (
+    DATASET_LIMITS,
+    calculate_accuracy,
+    create_dataloaders,
+    get_device,
+    save_metrics_csv,
+    save_training_plot,
+)
 
 
 class CustomCNN(nn.Module):
@@ -88,10 +95,15 @@ def validate(model, dataloader, criterion, device):
 def main():
     parser = argparse.ArgumentParser(description="Entrenar CNN propia para poses de mano.")
     parser.add_argument("--dataset", default="dataset", help="Ruta al dataset propio.")
-    parser.add_argument("--dataset_size", choices=["small", "medium"], required=True)
+    parser.add_argument("--dataset_size", choices=list(DATASET_LIMITS), required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=0.001)
+    parser.add_argument(
+        "--no_balanced_sampling",
+        action="store_true",
+        help="Desactiva el muestreo balanceado por clase durante entrenamiento.",
+    )
     parser.add_argument(
         "--train_images_per_class",
         type=int,
@@ -104,13 +116,13 @@ def main():
     Path("results").mkdir(exist_ok=True)
 
     device = get_device()
-    print(f"Dispositivo usado: {device}")
 
     train_loader, val_loader, _, class_names = create_dataloaders(
         args.dataset,
         args.dataset_size,
         args.batch_size,
         train_images_per_class=args.train_images_per_class,
+        balanced_sampling=not args.no_balanced_sampling,
     )
 
     model = CustomCNN(num_classes=len(class_names)).to(device)
@@ -151,6 +163,7 @@ def main():
             "architecture": "cnn",
             "dataset_size": args.dataset_size,
             "class_names": class_names,
+            "balanced_sampling": not args.no_balanced_sampling,
             "model_state_dict": model.state_dict(),
         },
         model_path,

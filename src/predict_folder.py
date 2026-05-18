@@ -1,5 +1,4 @@
 import argparse
-import csv
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -7,7 +6,12 @@ import torch
 from PIL import Image, UnidentifiedImageError
 from sklearn.metrics import accuracy_score, classification_report, precision_recall_fscore_support
 
-from predict import display_name, load_trained_model
+from predict import (
+    display_name,
+    load_trained_model,
+    save_prediction_visualization,
+    sorted_prediction_percentages,
+)
 from utils import CLASS_NAMES, IMAGE_EXTENSIONS, get_device, get_eval_transforms
 
 
@@ -33,7 +37,10 @@ def infer_true_label(image_path, input_folder):
     return None
 
 
-def predict_images(model, image_paths, input_folder, class_names, device):
+UNCERTAIN_LABEL = "no_seguro"
+
+
+def predict_images(model, image_paths, input_folder, class_names, device, confidence_threshold):
     """Clasifica una lista de imagenes y devuelve filas con resultados."""
     transform = get_eval_transforms()
     rows = []
@@ -46,8 +53,10 @@ def predict_images(model, image_paths, input_folder, class_names, device):
                 {
                     "image": str(image_path),
                     "true_label": "",
+                    "raw_predicted_label": "",
                     "predicted_label": "",
                     "confidence": "",
+                    "is_uncertain": "",
                     "error": str(error),
                 }
             )
@@ -61,51 +70,142 @@ def predict_images(model, image_paths, input_folder, class_names, device):
             confidence, predicted_index = torch.max(probabilities, dim=0)
 
         predicted_class = class_names[predicted_index.item()]
+        confidence_value = confidence.item()
+        is_uncertain = confidence_value < confidence_threshold
+        final_label = UNCERTAIN_LABEL if is_uncertain else display_name(predicted_class)
         true_label = infer_true_label(image_path, input_folder)
         row = {
             "image": str(image_path),
             "true_label": display_name(true_label) if true_label else "",
-            "predicted_label": display_name(predicted_class),
-            "confidence": confidence.item(),
+            "raw_predicted_label": display_name(predicted_class),
+            "predicted_label": final_label,
+            "confidence": confidence_value,
+            "confidence_percentage": confidence_value * 100,
+            "is_uncertain": is_uncertain,
             "error": "",
         }
 
         for class_name, probability in zip(class_names, probabilities.cpu().tolist()):
             row[f"prob_{display_name(class_name)}"] = probability
+            row[f"prob_pct_{display_name(class_name)}"] = probability * 100
 
         rows.append(row)
 
     return rows
 
 
-def save_predictions_csv(rows, output_path):
-    """Guarda las predicciones individuales en CSV."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def build_summary_rows(valid_rows):
+    """Construye un resumen por categoria predicha."""
+    total = len(valid_rows)
+    summary_rows = []
+    rows_by_class = defaultdict(list)
 
-    fieldnames = []
+    for row in valid_rows:
+        rows_by_class[row["predicted_label"]].append(row)
+
+    for label in sorted(rows_by_class):
+        class_rows = rows_by_class[label]
+        confidences = [float(row["confidence"]) for row in class_rows]
+        count = len(class_rows)
+        percentage = count / total if total else 0.0
+        summary_rows.append(
+            {
+                "predicted_label": label,
+                "count": count,
+                "percentage": percentage,
+                "average_confidence": sum(confidences) / count if count else 0.0,
+                "min_confidence": min(confidences) if confidences else 0.0,
+                "max_confidence": max(confidences) if confidences else 0.0,
+            }
+        )
+
+    return summary_rows
+
+
+def row_probabilities(row, class_names):
+    """Extrae las probabilidades de una fila en el mismo orden de class_names."""
+    return [float(row[f"prob_{display_name(class_name)}"]) for class_name in class_names]
+
+
+def build_visualization_path(image_path, input_folder, output_dir):
+    """Construye un nombre estable para la imagen anotada."""
+    relative_path = Path(image_path).relative_to(input_folder)
+    stem_parts = relative_path.with_suffix("").parts
+    filename = "__".join(stem_parts)
+    safe_filename = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in filename
+    )
+    return Path(output_dir) / f"{safe_filename}_prediction.png"
+
+
+def save_folder_visualizations(rows, input_folder, output_dir, class_names):
+    """Guarda una visualizacion anotada por cada imagen clasificada."""
+    output_dir = Path(output_dir)
+    saved_paths = []
+
     for row in rows:
-        for key in row:
-            if key not in fieldnames:
-                fieldnames.append(key)
+        if row["error"]:
+            continue
 
-    with output_path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+        image_path = Path(row["image"])
+        probabilities = row_probabilities(row, class_names)
+        output_path = build_visualization_path(image_path, input_folder, output_dir)
+
+        save_prediction_visualization(
+            image_path=image_path,
+            output_path=output_path,
+            class_names=class_names,
+            probabilities=probabilities,
+            predicted_label=row["raw_predicted_label"],
+            confidence=float(row["confidence"]),
+            final_label=row["predicted_label"],
+            true_label=row["true_label"] or None,
+        )
+        saved_paths.append(output_path)
+
+    return saved_paths
 
 
-def print_unlabeled_metrics(valid_rows):
+def print_summary_table(summary_rows, total):
+    """Imprime una tabla compacta con cantidades, porcentajes y confianza."""
+    print("\nResumen general:")
+    print(f"{'Categoria':<18} {'Cantidad':>8} {'Porcentaje':>11} {'Conf. prom.':>12}")
+    print("-" * 53)
+
+    for row in summary_rows:
+        print(
+            f"{row['predicted_label']:<18} "
+            f"{row['count']:>8} "
+            f"{row['percentage'] * 100:>10.2f}% "
+            f"{row['average_confidence'] * 100:>11.2f}%"
+        )
+
+    print("-" * 53)
+    print(f"{'Total':<18} {total:>8} {100:>10.2f}%")
+
+
+def format_probability_line(row, class_names):
+    """Formatea los porcentajes por categoria para consola."""
+    probabilities = row_probabilities(row, class_names)
+    return " | ".join(
+        f"{class_name}: {percentage:.2f}%"
+        for class_name, percentage in sorted_prediction_percentages(class_names, probabilities)
+    )
+
+
+def print_unlabeled_metrics(valid_rows, confidence_threshold):
     """Imprime metricas disponibles cuando no hay etiquetas reales."""
     total = len(valid_rows)
     confidences = [float(row["confidence"]) for row in valid_rows]
     average_confidence = sum(confidences) / total if total else 0.0
-    low_confidence_count = sum(confidence < 0.60 for confidence in confidences)
+    uncertain_count = sum(row["predicted_label"] == UNCERTAIN_LABEL for row in valid_rows)
 
     print("\nMetricas sin etiquetas reales:")
     print(f"  Imagenes clasificadas: {total}")
     print(f"  Confianza promedio: {average_confidence * 100:.2f}%")
-    print(f"  Imagenes con confianza menor a 60%: {low_confidence_count}")
+    print(f"  Umbral de no seguro: {confidence_threshold * 100:.2f}%")
+    print(f"  Imagenes marcadas como no_seguro: {uncertain_count}")
 
     counts = Counter(row["predicted_label"] for row in valid_rows)
     confidence_by_class = defaultdict(list)
@@ -123,7 +223,7 @@ def print_labeled_metrics(valid_rows, class_names):
     """Imprime metricas reales cuando las imagenes estan en subcarpetas por clase."""
     labels = [row["true_label"] for row in valid_rows]
     predictions = [row["predicted_label"] for row in valid_rows]
-    display_class_names = [display_name(class_name) for class_name in class_names]
+    display_class_names = [display_name(class_name) for class_name in class_names] + [UNCERTAIN_LABEL]
 
     accuracy = accuracy_score(labels, predictions)
     precision, recall, f1, _ = precision_recall_fscore_support(
@@ -158,9 +258,25 @@ def main():
     parser.add_argument("--folder", default="imagen_prueba", help="Carpeta con imagenes a clasificar.")
     parser.add_argument("--architecture", choices=["cnn", "resnet"], default=None)
     parser.add_argument(
-        "--output",
+        "--visual_output",
         default=None,
-        help="Ruta del CSV de salida. Por defecto se guarda en results/.",
+        help="Carpeta donde se guardan las imagenes anotadas. Por defecto se guarda en results/.",
+    )
+    parser.add_argument(
+        "--no_visualizations",
+        action="store_true",
+        help="No genera imagenes anotadas con prediccion y porcentajes.",
+    )
+    parser.add_argument(
+        "--confidence_threshold",
+        type=float,
+        default=0.60,
+        help="Confianza minima para aceptar una clase. Debajo de este valor queda como no_seguro.",
+    )
+    parser.add_argument(
+        "--hide_predictions",
+        action="store_true",
+        help="Oculta en consola la prediccion individual de cada imagen.",
     )
     args = parser.parse_args()
 
@@ -179,17 +295,34 @@ def main():
 
     device = get_device()
     model, class_names, architecture = load_trained_model(model_path, args.architecture, device)
-    rows = predict_images(model, image_paths, input_folder, class_names, device)
+    if not 0 <= args.confidence_threshold <= 1:
+        raise ValueError("confidence_threshold debe estar entre 0 y 1.")
+
+    rows = predict_images(
+        model,
+        image_paths,
+        input_folder,
+        class_names,
+        device,
+        args.confidence_threshold,
+    )
 
     model_stem = model_path.stem
-    output_path = args.output
-    if output_path is None:
-        output_path = Path("results") / f"{model_stem}_imagen_prueba_predictions.csv"
-
-    save_predictions_csv(rows, output_path)
+    visual_output_dir = args.visual_output
+    if visual_output_dir is None:
+        visual_output_dir = Path("results") / f"{model_stem}_{input_folder.name}_visualizations"
 
     valid_rows = [row for row in rows if not row["error"]]
     error_rows = [row for row in rows if row["error"]]
+    summary_rows = build_summary_rows(valid_rows)
+    visualization_paths = []
+    if not args.no_visualizations:
+        visualization_paths = save_folder_visualizations(
+            valid_rows,
+            input_folder,
+            visual_output_dir,
+            class_names,
+        )
 
     print(f"Modelo: {model_path}")
     print(f"Arquitectura: {architecture}")
@@ -197,13 +330,18 @@ def main():
     print(f"Imagenes encontradas: {len(image_paths)}")
     print(f"Imagenes clasificadas: {len(valid_rows)}")
     print(f"Imagenes con error: {len(error_rows)}")
+    print(f"Umbral de no seguro: {args.confidence_threshold * 100:.2f}%")
 
-    print("\nPredicciones:")
-    for row in valid_rows:
-        print(
-            f"  {row['image']} -> {row['predicted_label']} "
-            f"({float(row['confidence']) * 100:.2f}%)"
-        )
+    print_summary_table(summary_rows, len(valid_rows))
+
+    if not args.hide_predictions:
+        print("\nPredicciones:")
+        for row in valid_rows:
+            print(
+                f"  {row['image']} -> {row['predicted_label']} "
+                f"(modelo: {row['raw_predicted_label']}, {float(row['confidence']) * 100:.2f}%)"
+            )
+            print(f"    {format_probability_line(row, class_names)}")
 
     if error_rows:
         print("\nErrores:")
@@ -214,13 +352,15 @@ def main():
     if has_true_labels:
         print_labeled_metrics(valid_rows, class_names)
     else:
-        print_unlabeled_metrics(valid_rows)
+        print_unlabeled_metrics(valid_rows, args.confidence_threshold)
         print(
             "\nNota: no se calcula accuracy/precision/recall reales porque "
             "imagen_prueba no esta separada en subcarpetas con etiquetas."
         )
 
-    print(f"\nCSV guardado en: {output_path}")
+    if not args.no_visualizations:
+        print(f"\nImagenes anotadas guardadas en: {visual_output_dir}")
+        print(f"Visualizaciones generadas: {len(visualization_paths)}")
 
 
 if __name__ == "__main__":

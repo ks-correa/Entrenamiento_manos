@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 
 
@@ -18,7 +18,7 @@ DISPLAY_CLASS_NAMES = {
     "pulgar_arriba": "pulgar_arriba",
 }
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".avif"}
-DATASET_LIMITS = {"small": 25, "medium": 50}
+DATASET_LIMITS = {"pequeno": 1 / 3, "mediano": 2 / 3, "grande": 1.0}
 
 
 class HandPoseDataset(Dataset):
@@ -66,21 +66,30 @@ def find_images(class_dir):
     )
 
 
+def calculate_class_limit(total_images, dataset_size):
+    """Calcula cuantas imagenes usar para una clase segun el tamano pedido."""
+    if dataset_size not in DATASET_LIMITS:
+        valid_sizes = ", ".join(DATASET_LIMITS)
+        raise ValueError(f"dataset_size debe ser uno de: {valid_sizes}")
+
+    if dataset_size == "grande":
+        return total_images
+
+    return max(3, int(total_images * DATASET_LIMITS[dataset_size]))
+
+
 def load_dataset_samples(dataset_dir, dataset_size, seed=42, min_images_per_class=None):
     """
-    Carga rutas de imagen usando maximo 25 o 50 imagenes por clase.
+    Carga rutas de imagen usando un porcentaje definido por clase.
 
-    Si aun no hay suficientes imagenes para una clase, usa las disponibles y
-    muestra un aviso. Esto permite avanzar mientras se completa el dataset.
+    pequeno usa aproximadamente un tercio de cada carpeta, mediano dos tercios
+    y grande usa todas las imagenes disponibles en cada clase.
     """
     if dataset_size not in DATASET_LIMITS:
         valid_sizes = ", ".join(DATASET_LIMITS)
         raise ValueError(f"dataset_size debe ser uno de: {valid_sizes}")
 
     dataset_path = verify_dataset_structure(dataset_dir)
-    max_per_class = DATASET_LIMITS[dataset_size]
-    if min_images_per_class is not None:
-        max_per_class = max(max_per_class, min_images_per_class)
     rng = random.Random(seed)
     samples_by_class = {}
 
@@ -91,14 +100,12 @@ def load_dataset_samples(dataset_dir, dataset_size, seed=42, min_images_per_clas
         if not images:
             raise ValueError(f"La clase '{class_name}' no tiene imagenes.")
 
+        max_per_class = calculate_class_limit(len(images), dataset_size)
+        if min_images_per_class is not None:
+            max_per_class = max(max_per_class, min_images_per_class)
+
         rng.shuffle(images)
         selected_images = images[:max_per_class]
-
-        if min_images_per_class is None and len(images) < max_per_class:
-            print(
-                f"Aviso: clase '{class_name}' tiene {len(images)} imagenes; "
-                f"se usaran todas para '{dataset_size}'."
-            )
 
         samples_by_class[class_name] = [(image_path, label) for image_path in selected_images]
 
@@ -166,12 +173,19 @@ def get_train_transforms():
     """Transformaciones con data augmentation solo para entrenamiento."""
     return transforms.Compose(
         [
-            transforms.Resize((224, 224)),
+            transforms.RandomResizedCrop(224, scale=(0.80, 1.0), ratio=(0.85, 1.15)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomRotation(degrees=20),
+            transforms.RandomAffine(
+                degrees=0,
+                translate=(0.08, 0.08),
+                scale=(0.90, 1.10),
+                shear=8,
+            ),
+            transforms.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.2),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.15, scale=(0.02, 0.10), ratio=(0.3, 3.3)),
         ]
     )
 
@@ -194,6 +208,7 @@ def create_dataloaders(
     seed=42,
     num_workers=0,
     train_images_per_class=None,
+    balanced_sampling=True,
 ):
     """Crea DataLoaders de PyTorch para train, val y test."""
     min_images_per_class = None
@@ -216,10 +231,12 @@ def create_dataloaders(
     val_dataset = HandPoseDataset(val_samples, transform=get_eval_transforms())
     test_dataset = HandPoseDataset(test_samples, transform=get_eval_transforms())
 
+    train_sampler = build_balanced_sampler(train_samples) if balanced_sampling else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=num_workers,
     )
     val_loader = DataLoader(
@@ -235,12 +252,24 @@ def create_dataloaders(
         num_workers=num_workers,
     )
 
-    print_dataset_summary(samples_by_class, train_samples, val_samples, test_samples)
+    print_dataset_summary(
+        samples_by_class,
+        train_samples,
+        val_samples,
+        test_samples,
+        balanced_sampling=balanced_sampling,
+    )
 
     return train_loader, val_loader, test_loader, CLASS_NAMES
 
 
-def print_dataset_summary(samples_by_class, train_samples, val_samples, test_samples):
+def print_dataset_summary(
+    samples_by_class,
+    train_samples,
+    val_samples,
+    test_samples,
+    balanced_sampling=False,
+):
     """Muestra un resumen para confirmar que se usa el dataset propio."""
     train_counts = count_samples_by_class(train_samples)
     val_counts = count_samples_by_class(val_samples)
@@ -257,6 +286,8 @@ def print_dataset_summary(samples_by_class, train_samples, val_samples, test_sam
     print(f"  Entrenamiento: {len(train_samples)} imagenes")
     print(f"  Validacion: {len(val_samples)} imagenes")
     print(f"  Prueba: {len(test_samples)} imagenes\n")
+    if balanced_sampling:
+        print("  Balanceo: activo en entrenamiento para compensar clases con menos imagenes\n")
 
 
 def count_samples_by_class(samples):
@@ -267,9 +298,31 @@ def count_samples_by_class(samples):
     return counts
 
 
+def build_balanced_sampler(samples):
+    """Crea un sampler para que las clases minoritarias aparezcan mas durante training."""
+    label_counts = {label: 0 for label in range(len(CLASS_NAMES))}
+    for _, label in samples:
+        label_counts[label] += 1
+
+    sample_weights = [1.0 / label_counts[label] for _, label in samples]
+    return WeightedRandomSampler(
+        weights=torch.DoubleTensor(sample_weights),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+
 def get_device():
-    """Selecciona GPU si esta disponible; de lo contrario usa CPU."""
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """Selecciona GPU CUDA si esta disponible; de lo contrario usa CPU."""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"GPU detectada: {gpu_name}. El entrenamiento usara CUDA.")
+        return device
+
+    device = torch.device("cpu")
+    print("No se detecto GPU compatible con CUDA. El entrenamiento usara CPU.")
+    return device
 
 
 def calculate_accuracy(outputs, labels):
